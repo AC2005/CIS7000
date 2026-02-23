@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  trading-dev:
+    build: .
+    container_name: trading_system_dev
+    privileged: true 
+    cap_add:
+      - SYS_ADMIN
+      - SYS_NICE      
+      - IPC_LOCK      
+    volumes:
+      - .:/workspace
+      - /dev/hugepages:/dev/hugepages  
+    shm_size: '2gb'   
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      rtprio:      
+        soft: 99
+        hard: 99
+    security_opt:
+      - seccomp:unconfined
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
