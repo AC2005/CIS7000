@@ -111,21 +111,22 @@ std::optional<size_t> RegionManager::allocate_region(const char* name, size_t ca
     return region_count - 1;
 }
 
-void RegionManager::expand_region(size_t region_id, size_t num_bytes) {
+bool RegionManager::expand_region(size_t region_id, size_t num_bytes) {
     if (region_id >= region_count) {
         fprintf(stderr, "Cannot find region");
-        return;
+        return false;
     } 
 
     Region& r = regions[region_id];
     size_t aligned = align_up(num_bytes, get_page_size());
     if (r.bytes_committed + aligned > r.capacity) {
         fprintf(stderr, "Expansion would cause overflow");
-        return;
+        return false;
     }
 
     vas.commit(r.start_offset + r.bytes_committed, aligned);
     r.bytes_committed += aligned;
+    return true;
 }
 
 std::optional<size_t> RegionManager::lookup_by_addr(void* addr) {

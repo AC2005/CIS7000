@@ -74,7 +74,7 @@ class RegionManager {
         ~RegionManager() {};
 
         std::optional<size_t> allocate_region(const char* name, size_t capacity, AllocatorType allocator);
-        void expand_region(size_t region_id, size_t num_bytes);
+        bool expand_region(size_t region_id, size_t num_bytes);
         std::optional<size_t> lookup_by_addr(void* addr);
         std::tuple<FaultType, std::optional<size_t>> is_guard_page(void* addr);
 
@@ -83,6 +83,10 @@ class RegionManager {
                 return std::nullopt;
             }
             return regions[i];
+        }
+
+        void* get_absolute_addr(size_t offset) {
+            return static_cast<char*>(vas.get_base_addr()) + offset;
         }
         // debug functions
         std::optional<size_t> lookup_by_name(const char* name);

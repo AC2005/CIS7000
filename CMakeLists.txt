@@ -23,15 +23,15 @@ if(ENABLE_TSAN)
 endif()
 
 find_package(Threads REQUIRED)
-find_package(GTest REQUIRED)
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
-    ${GTEST_INCLUDE_DIRS}
 )
 
 set(SOURCES
     src/virtual_memory_manager.cpp
+    src/slab_allocator.cpp
+    src/signal_handler.cpp
 )
 
 add_executable(virtual_memory_manager_test
@@ -39,4 +39,26 @@ add_executable(virtual_memory_manager_test
     ${SOURCES}
 )
 
-target_link_libraries(virtual_memory_manager_test PRIVATE Threads::Threads rt)
+add_executable(slab_allocator_test
+    tests/slab_allocator_test.cpp
+    ${SOURCES}
+)
+
+add_executable(ring_buffer_test
+    tests/ring_buffer_test.cpp
+    ${SOURCES}
+)
+
+add_executable(allocator_benchmark
+    tests/allocator_benchmark.cpp
+    ${SOURCES}
+)
+
+foreach(target
+    virtual_memory_manager_test
+    slab_allocator_test
+    ring_buffer_test
+    allocator_benchmark
+)
+    target_link_libraries(${target} PRIVATE Threads::Threads rt)
+endforeach()
