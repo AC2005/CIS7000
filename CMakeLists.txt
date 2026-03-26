@@ -32,6 +32,8 @@ set(SOURCES
     src/virtual_memory_manager.cpp
     src/slab_allocator.cpp
     src/signal_handler.cpp
+    src/shared_memory.cpp
+    src/order_book.cpp
 )
 
 add_executable(virtual_memory_manager_test
@@ -54,11 +56,29 @@ add_executable(allocator_benchmark
     ${SOURCES}
 )
 
+add_executable(market_data_receiver
+    src/market_data_receiver.cpp
+    ${SOURCES}
+)
+
+add_executable(strategy_engine
+    src/strategy_engine.cpp
+    ${SOURCES}
+)
+
+add_executable(seqlock_test
+    tests/seqlock_test.cpp
+    ${SOURCES}
+)
+
 foreach(target
     virtual_memory_manager_test
     slab_allocator_test
     ring_buffer_test
     allocator_benchmark
+    market_data_receiver
+    strategy_engine
+    seqlock_test
 )
     target_link_libraries(${target} PRIVATE Threads::Threads rt)
 endforeach()
