@@ -56,6 +56,10 @@ public:
         return seq.load(std::memory_order_relaxed);
     }
 
+    void reset() {
+        seq.store(0, std::memory_order_seq_cst);
+        data = T{};
+    }
 private:
     // seq and data on separate cache lines to prevent false sharing
     alignas(64) std::atomic<uint64_t> seq;

@@ -2,6 +2,9 @@
 #include "ring_buffer.h"
 #include "order_book.h"
 #include "seqlock.h"
+#include "heartbeat.h"
+#include "latency.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
@@ -9,11 +12,12 @@
 #include <time.h>
 #include <atomic>
 
-static constexpr size_t      RING_CAPACITY = 1024;
-static constexpr size_t      NUM_MESSAGES  = 1'000'000;
-static constexpr const char* SHM_RING      = "/trading_ringbuf";
-static constexpr const char* SHM_TOB       = "/trading_tob";
-static constexpr uint64_t    SPREAD_THRESHOLD = 8;  // signal if spread <= this
+static constexpr size_t      RING_CAPACITY    = 1024;
+static constexpr const char* SHM_RING         = "/trading_ringbuf";
+static constexpr const char* SHM_TOB          = "/trading_tob";
+static constexpr const char* SHM_HEARTBEAT    = "/trading_heartbeat";
+static constexpr const char* SHM_LATENCY      = "/trading_latency";
+static constexpr uint64_t    SPREAD_THRESHOLD = 8;
 
 static volatile bool g_running = true;
 
@@ -32,16 +36,16 @@ int main() {
     signal(SIGINT,  on_signal);
     signal(SIGTERM, on_signal);
 
-    // ---- attach to shared memory ----
     printf("strategy_engine: attaching to shared memory\n");
 
     SharedMemory shm_ring = SharedMemory::attach(SHM_RING,
                                 sizeof(RingBuffer<RING_CAPACITY>));
     SharedMemory shm_tob  = SharedMemory::attach(SHM_TOB,
                                 sizeof(Seqlock<TopOfBook>));
-
-    shm_ring.debug_dump();
-    shm_tob.debug_dump();
+    SharedMemory shm_lat  = SharedMemory::attach(SHM_LATENCY,
+                                sizeof(LatencyRegion));
+    SharedMemory shm_hb   = SharedMemory::attach(SHM_HEARTBEAT,
+                                sizeof(HeartbeatRegion));
 
     RingBuffer<RING_CAPACITY>* rb =
         static_cast<RingBuffer<RING_CAPACITY>*>(shm_ring.get_ptr());
@@ -49,101 +53,106 @@ int main() {
     Seqlock<TopOfBook>* tob_sl =
         static_cast<Seqlock<TopOfBook>*>(shm_tob.get_ptr());
 
+    LatencyRegion* lat =
+        static_cast<LatencyRegion*>(shm_lat.get_ptr());
+
+    HeartbeatRegion* hb_region =
+        static_cast<HeartbeatRegion*>(shm_hb.get_ptr());
+
+    Heartbeat& my_hb   = hb_region->beats[(size_t)ProcessRole::STRATEGY_ENGINE];
+    Heartbeat& peer_hb = hb_region->beats[(size_t)ProcessRole::MARKET_DATA_RECEIVER];
+    uint64_t peer_gen  = peer_hb.generation.load(std::memory_order_acquire);
+
     printf("strategy_engine: running\n\n");
 
-    // ---- stats ----
-    uint64_t msgs_received  = 0;
-    uint64_t seq_errors     = 0;
-    uint64_t invalid_reads  = 0;
-    uint64_t trade_signals  = 0;
-    uint64_t total_latency  = 0;
-    uint64_t max_latency    = 0;
-    uint64_t tob_reads      = 0;
-    uint64_t expected_seq   = 0;
+    uint64_t expected_seq = 0;
+    uint64_t t_start      = now_ns();
 
-    uint64_t t_start = now_ns();
-
-    while (msgs_received < NUM_MESSAGES && g_running) {
+    while (g_running) {
 
         // ---- consume from ring buffer ----
         Message m{};
         if (rb->try_pop(m)) {
-            uint64_t recv_time = now_ns();
+            uint64_t pop_time = now_ns();
 
+            // ring IPC latency — push timestamp to pop time
+            lat->ring_pop_latency.record(pop_time - m.timestamp);
+            lat->total_popped.fetch_add(1, std::memory_order_relaxed);
+
+            // sequence check
             if (m.sequence != expected_seq) {
-                seq_errors++;
-                fprintf(stderr, "strategy_engine: seq error expected=%zu got=%zu\n",
-                        (size_t)expected_seq, (size_t)m.sequence);
+                lat->seq_errors.fetch_add(1, std::memory_order_relaxed);
                 expected_seq = m.sequence + 1;
             } else {
                 expected_seq++;
             }
 
-            uint64_t latency = recv_time - m.timestamp;
-            total_latency += latency;
-            if (latency > max_latency) max_latency = latency;
+            // ---- read top of book ----
+            uint64_t tob_t0 = now_ns();
+            TopOfBook snapshot = tob_sl->read();
+            uint64_t tob_t1 = now_ns();
+            lat->tob_read.record(tob_t1 - tob_t0);
 
-            msgs_received++;
-        }
+            // full pipeline latency — message generation to strategy decision
+            lat->pipeline.record(tob_t1 - m.timestamp);
 
-        // ---- read top of book via seqlock ----
-        TopOfBook snapshot = tob_sl->read();
-        tob_reads++;
-
-        if (snapshot.bid_price > 0 && snapshot.ask_price > 0) {
-            if (!snapshot.is_valid()) {
-                invalid_reads++;
-                fprintf(stderr,
-                    "strategy_engine: INVALID TOB READ bid=%zu ask=%zu\n",
-                    (size_t)snapshot.bid_price,
-                    (size_t)snapshot.ask_price);
+            // validate
+            if (snapshot.bid_price > 0 && !snapshot.is_valid()) {
+                lat->invalid_tob_reads.fetch_add(1, std::memory_order_relaxed);
+                fprintf(stderr, "strategy_engine: INVALID TOB bid=%zu ask=%zu\n",
+                        (size_t)snapshot.bid_price,
+                        (size_t)snapshot.ask_price);
             }
 
-            // simple strategy: signal when spread is tight
-            uint64_t spread = snapshot.ask_price - snapshot.bid_price;
-            if (spread <= SPREAD_THRESHOLD) {
-                trade_signals++;
-                if (trade_signals <= 5) {
-                    // print first few signals so we can see them
-                    printf("TRADE SIGNAL #%zu: ", (size_t)trade_signals);
-                    snapshot.print();
+            // strategy decision
+            if (snapshot.bid_price > 0 && snapshot.ask_price > 0) {
+                uint64_t spread = snapshot.ask_price - snapshot.bid_price;
+                if (spread <= SPREAD_THRESHOLD) {
+                    uint64_t signals = lat->trade_signals.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (signals < 3) {
+                        printf("TRADE SIGNAL #%zu: ", (size_t)(signals + 1));
+                        snapshot.print();
+                    }
                 }
             }
         }
 
-        // print progress every 100k messages
-        if (msgs_received > 0 && msgs_received % 100'000 == 0) {
-            printf("strategy_engine: received %zu / %zu  "
-                   "avg_latency: %zu ns  signals: %zu\n",
-                   (size_t)msgs_received, NUM_MESSAGES,
-                   (size_t)(total_latency / msgs_received),
-                   (size_t)trade_signals);
+        // ---- heartbeat + peer restart detection ----
+        if (expected_seq % 1000 == 0) {
+            my_hb.beat();
+
+            uint64_t cur_gen = peer_hb.generation.load(std::memory_order_acquire);
+            if (cur_gen != peer_gen) {
+                printf("strategy_engine: peer restart detected "
+                       "(gen %zu → %zu) resyncing\n",
+                       (size_t)peer_gen, (size_t)cur_gen);
+                peer_gen     = cur_gen;
+                expected_seq = 0;
+            }
+        }
+
+        // status every 1M messages
+        if (expected_seq > 0 && expected_seq % 1'000'000 == 0) {
+            double elapsed = (now_ns() - t_start) / 1e9;
+            printf("strategy_engine: %zu msgs  %.0f msg/s  signals=%zu\n",
+                   (size_t)expected_seq,
+                   (double)expected_seq / elapsed,
+                   (size_t)lat->trade_signals.load());
         }
     }
 
-    uint64_t t_end    = now_ns();
-    double elapsed_s  = (t_end - t_start) / 1e9;
-    double throughput = msgs_received / elapsed_s;
+    // ---- shutdown ----
+    printf("strategy_engine: shutting down\n");
+    my_hb.shutdown();
 
-    printf("\nstrategy_engine: done\n");
-    printf("  messages received:   %zu\n",   (size_t)msgs_received);
-    printf("  sequence errors:     %zu\n",   (size_t)seq_errors);
-    printf("  tob reads:           %zu\n",   (size_t)tob_reads);
-    printf("  invalid tob reads:   %zu\n",   (size_t)invalid_reads);
-    printf("  trade signals:       %zu\n",   (size_t)trade_signals);
-    printf("  elapsed:             %.3f s\n", elapsed_s);
-    printf("  throughput:          %.0f msg/s\n", throughput);
-    printf("  avg msg latency:     %zu ns\n",
-           msgs_received > 0 ? (size_t)(total_latency / msgs_received) : 0);
-    printf("  max msg latency:     %zu ns\n",   (size_t)max_latency);
+    double elapsed_s = (now_ns() - t_start) / 1e9;
+    size_t popped    = (size_t)lat->total_popped.load();
+    printf("strategy_engine: done  popped=%zu  throughput=%.0f msg/s\n",
+           popped, popped / elapsed_s);
 
-    if (seq_errors == 0 && invalid_reads == 0) {
-        printf("\n  PASS: zero sequence errors, zero invalid TOB reads\n");
-    } else {
-        printf("\n  FAIL: %zu seq errors, %zu invalid TOB reads\n",
-               (size_t)seq_errors, (size_t)invalid_reads);
-        return 1;
-    }
+    // print the full latency report — consumer has all the data
+    lat->print_report();
 
     return 0;
 }

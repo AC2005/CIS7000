@@ -81,24 +81,36 @@ static_assert(sizeof(Order) == 64, "Order must be 64 bytes");
 // Benchmark 1: sequential alloc then free
 // -------------------------------------------------------
 
+// Batch size for amortized timing — operations faster than the ~32ns clock
+// tick must be timed in groups; individual timestamps would all read 0 or 32ns.
+static constexpr size_t TIMING_BATCH = 1000;
+
 void bench_slab_sequential(SlabAllocator& slab, size_t N,
                             Histogram& alloc_hist, Histogram& free_hist) {
     std::vector<void*> ptrs(N);
 
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
         uint64_t t0 = now_ns();
-        ptrs[i] = slab.allocate();
+        for (size_t j = 0; j < batch; j++) {
+            ptrs[i + j] = slab.allocate();
+            assert(ptrs[i + j]);
+        }
         uint64_t t1 = now_ns();
-        alloc_hist.record(t1 - t0);
-        assert(ptrs[i]);
-        static_cast<Order*>(ptrs[i])->id = i;  // touch it
+        uint64_t per_op = (t1 - t0) / batch;
+        for (size_t j = 0; j < batch; j++) {
+            alloc_hist.record(per_op);
+            static_cast<Order*>(ptrs[i + j])->id = i + j;  // touch it
+        }
     }
 
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
         uint64_t t0 = now_ns();
-        slab.deallocate(ptrs[i]);
+        for (size_t j = 0; j < batch; j++) slab.deallocate(ptrs[i + j]);
         uint64_t t1 = now_ns();
-        free_hist.record(t1 - t0);
+        uint64_t per_op = (t1 - t0) / batch;
+        for (size_t j = 0; j < batch; j++) free_hist.record(per_op);
     }
 }
 
@@ -106,20 +118,28 @@ void bench_malloc_sequential(size_t N,
                               Histogram& alloc_hist, Histogram& free_hist) {
     std::vector<void*> ptrs(N);
 
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
         uint64_t t0 = now_ns();
-        ptrs[i] = malloc(sizeof(Order));
+        for (size_t j = 0; j < batch; j++) {
+            ptrs[i + j] = malloc(sizeof(Order));
+            assert(ptrs[i + j]);
+        }
         uint64_t t1 = now_ns();
-        alloc_hist.record(t1 - t0);
-        assert(ptrs[i]);
-        static_cast<Order*>(ptrs[i])->id = i;
+        uint64_t per_op = (t1 - t0) / batch;
+        for (size_t j = 0; j < batch; j++) {
+            alloc_hist.record(per_op);
+            static_cast<Order*>(ptrs[i + j])->id = i + j;
+        }
     }
 
-    for (size_t i = 0; i < N; i++) {
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
         uint64_t t0 = now_ns();
-        free(ptrs[i]);
+        for (size_t j = 0; j < batch; j++) free(ptrs[i + j]);
         uint64_t t1 = now_ns();
-        free_hist.record(t1 - t0);
+        uint64_t per_op = (t1 - t0) / batch;
+        for (size_t j = 0; j < batch; j++) free_hist.record(per_op);
     }
 }
 
@@ -133,20 +153,30 @@ void bench_slab_interleaved(SlabAllocator& slab, size_t N,
     std::vector<void*> window(WINDOW, nullptr);
     size_t idx = 0;
 
-    for (size_t i = 0; i < N; i++) {
-        if (window[idx]) {
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
+        uint64_t free_total = 0, alloc_total = 0;
+        size_t free_count = 0;
+        for (size_t j = 0; j < batch; j++) {
+            if (window[idx]) {
+                uint64_t t0 = now_ns();
+                slab.deallocate(window[idx]);
+                free_total += now_ns() - t0;
+                free_count++;
+            }
             uint64_t t0 = now_ns();
-            slab.deallocate(window[idx]);
-            uint64_t t1 = now_ns();
-            free_hist.record(t1 - t0);
+            window[idx] = slab.allocate();
+            alloc_total += now_ns() - t0;
+            assert(window[idx]);
+            static_cast<Order*>(window[idx])->id = i + j;
+            idx = (idx + 1) % WINDOW;
         }
-        uint64_t t0 = now_ns();
-        window[idx] = slab.allocate();
-        uint64_t t1 = now_ns();
-        alloc_hist.record(t1 - t0);
-        assert(window[idx]);
-        static_cast<Order*>(window[idx])->id = i;
-        idx = (idx + 1) % WINDOW;
+        uint64_t alloc_per_op = alloc_total / batch;
+        for (size_t j = 0; j < batch; j++) alloc_hist.record(alloc_per_op);
+        if (free_count) {
+            uint64_t free_per_op = free_total / free_count;
+            for (size_t j = 0; j < free_count; j++) free_hist.record(free_per_op);
+        }
     }
 
     for (size_t i = 0; i < WINDOW; i++) {
@@ -160,20 +190,30 @@ void bench_malloc_interleaved(size_t N,
     std::vector<void*> window(WINDOW, nullptr);
     size_t idx = 0;
 
-    for (size_t i = 0; i < N; i++) {
-        if (window[idx]) {
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
+        uint64_t free_total = 0, alloc_total = 0;
+        size_t free_count = 0;
+        for (size_t j = 0; j < batch; j++) {
+            if (window[idx]) {
+                uint64_t t0 = now_ns();
+                free(window[idx]);
+                free_total += now_ns() - t0;
+                free_count++;
+            }
             uint64_t t0 = now_ns();
-            free(window[idx]);
-            uint64_t t1 = now_ns();
-            free_hist.record(t1 - t0);
+            window[idx] = malloc(sizeof(Order));
+            alloc_total += now_ns() - t0;
+            assert(window[idx]);
+            static_cast<Order*>(window[idx])->id = i + j;
+            idx = (idx + 1) % WINDOW;
         }
-        uint64_t t0 = now_ns();
-        window[idx] = malloc(sizeof(Order));
-        uint64_t t1 = now_ns();
-        alloc_hist.record(t1 - t0);
-        assert(window[idx]);
-        static_cast<Order*>(window[idx])->id = i;
-        idx = (idx + 1) % WINDOW;
+        uint64_t alloc_per_op = alloc_total / batch;
+        for (size_t j = 0; j < batch; j++) alloc_hist.record(alloc_per_op);
+        if (free_count) {
+            uint64_t free_per_op = free_total / free_count;
+            for (size_t j = 0; j < free_count; j++) free_hist.record(free_per_op);
+        }
     }
 
     for (size_t i = 0; i < WINDOW; i++) {
@@ -191,20 +231,33 @@ void bench_slab_random(SlabAllocator& slab, size_t N,
     std::vector<void*> pool(POOL, nullptr);
     srand(42);
 
-    for (size_t i = 0; i < N; i++) {
-        size_t slot = rand() % POOL;
-        if (pool[slot]) {
-            uint64_t t0 = now_ns();
-            slab.deallocate(pool[slot]);
-            uint64_t t1 = now_ns();
-            free_hist.record(t1 - t0);
-            pool[slot] = nullptr;
-        } else {
-            uint64_t t0 = now_ns();
-            pool[slot] = slab.allocate();
-            uint64_t t1 = now_ns();
-            alloc_hist.record(t1 - t0);
-            if (pool[slot]) static_cast<Order*>(pool[slot])->id = i;
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
+        uint64_t free_total = 0, alloc_total = 0;
+        size_t free_count = 0, alloc_count = 0;
+        for (size_t j = 0; j < batch; j++) {
+            size_t slot = rand() % POOL;
+            if (pool[slot]) {
+                uint64_t t0 = now_ns();
+                slab.deallocate(pool[slot]);
+                free_total += now_ns() - t0;
+                pool[slot] = nullptr;
+                free_count++;
+            } else {
+                uint64_t t0 = now_ns();
+                pool[slot] = slab.allocate();
+                alloc_total += now_ns() - t0;
+                if (pool[slot]) static_cast<Order*>(pool[slot])->id = i + j;
+                alloc_count++;
+            }
+        }
+        if (alloc_count) {
+            uint64_t per_op = alloc_total / alloc_count;
+            for (size_t j = 0; j < alloc_count; j++) alloc_hist.record(per_op);
+        }
+        if (free_count) {
+            uint64_t per_op = free_total / free_count;
+            for (size_t j = 0; j < free_count; j++) free_hist.record(per_op);
         }
     }
 
@@ -219,20 +272,33 @@ void bench_malloc_random(size_t N,
     std::vector<void*> pool(POOL, nullptr);
     srand(42);
 
-    for (size_t i = 0; i < N; i++) {
-        size_t slot = rand() % POOL;
-        if (pool[slot]) {
-            uint64_t t0 = now_ns();
-            free(pool[slot]);
-            uint64_t t1 = now_ns();
-            free_hist.record(t1 - t0);
-            pool[slot] = nullptr;
-        } else {
-            uint64_t t0 = now_ns();
-            pool[slot] = malloc(sizeof(Order));
-            uint64_t t1 = now_ns();
-            alloc_hist.record(t1 - t0);
-            if (pool[slot]) static_cast<Order*>(pool[slot])->id = i;
+    for (size_t i = 0; i < N; i += TIMING_BATCH) {
+        size_t batch = std::min(TIMING_BATCH, N - i);
+        uint64_t free_total = 0, alloc_total = 0;
+        size_t free_count = 0, alloc_count = 0;
+        for (size_t j = 0; j < batch; j++) {
+            size_t slot = rand() % POOL;
+            if (pool[slot]) {
+                uint64_t t0 = now_ns();
+                free(pool[slot]);
+                free_total += now_ns() - t0;
+                pool[slot] = nullptr;
+                free_count++;
+            } else {
+                uint64_t t0 = now_ns();
+                pool[slot] = malloc(sizeof(Order));
+                alloc_total += now_ns() - t0;
+                if (pool[slot]) static_cast<Order*>(pool[slot])->id = i + j;
+                alloc_count++;
+            }
+        }
+        if (alloc_count) {
+            uint64_t per_op = alloc_total / alloc_count;
+            for (size_t j = 0; j < alloc_count; j++) alloc_hist.record(per_op);
+        }
+        if (free_count) {
+            uint64_t per_op = free_total / free_count;
+            for (size_t j = 0; j < free_count; j++) free_hist.record(per_op);
         }
     }
 

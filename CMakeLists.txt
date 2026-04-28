@@ -71,6 +71,17 @@ add_executable(seqlock_test
     ${SOURCES}
 )
 
+add_executable(seqlock_benchmark
+    tests/seqlock_benchmark.cpp
+    ${SOURCES}
+)
+
+add_executable(supervisor
+    src/supervisor.cpp
+    ${SOURCES}
+)
+
+
 foreach(target
     virtual_memory_manager_test
     slab_allocator_test
@@ -79,6 +90,7 @@ foreach(target
     market_data_receiver
     strategy_engine
     seqlock_test
+    supervisor
 )
     target_link_libraries(${target} PRIVATE Threads::Threads rt)
 endforeach()
