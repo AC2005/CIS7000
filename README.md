@@ -1,4 +1,4 @@
-# HFT Trading System — OS Capstone
+# CIS 7000
 
 A high-performance multi-process trading system built in C++17 as an OS capstone project. The system demonstrates production-inspired HFT infrastructure built entirely from scratch: a custom virtual memory manager, slab allocator, lock-free ring buffer, seqlock, shared memory IPC, and a supervisor with crash recovery.
 
